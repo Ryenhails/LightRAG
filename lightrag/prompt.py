@@ -187,13 +187,13 @@ When handling relationships with timestamps:
 - If you don't know the answer, just say so.
 - Do not make anything up. Do not include information not provided by the Knowledge Base."""
 
-PROMPTS["keywords_extraction"] = """---Role---
+PROMPTS["keywords_extraction_clues"] = """---Role---
 
 You are a helpful assistant tasked with identifying both high-level and low-level keywords in the user's query and conversation history.
 
 ---Goal---
 
-Given the query and conversation history, list both high-level and low-level keywords. High-level keywords focus on overarching concepts or themes, while low-level keywords focus on specific entities, details, or concrete terms.
+Given the query, content keywords from data base and conversation history, list both high-level and low-level keywords. High-level keywords focus on overarching concepts or themes, while low-level keywords focus on specific entities, details, or concrete terms.
 
 ---Instructions---
 
@@ -216,10 +216,51 @@ Conversation History:
 
 Current Query: {query}
 ######################
+
+Data Base Content Keywords: {content_keywords}
+######################
+
 The `Output` should be human text, not unicode characters. Keep the same language as `Query`.
 Output:
 
 """
+
+PROMPTS["keywords_extraction"] = """---Role---
+
+You are a helpful assistant tasked with identifying both high-level and low-level keywords in the user's query and conversation history.
+
+---Goal---
+
+Given the query, and conversation history, list both high-level and low-level keywords. High-level keywords focus on overarching concepts or themes, while low-level keywords focus on specific entities, details, or concrete terms.
+
+---Instructions---
+
+- Consider both the current query and relevant conversation history when extracting keywords
+- Output the keywords in JSON format
+- The JSON should have two keys:
+  - "high_level_keywords" for overarching concepts or themes
+  - "low_level_keywords" for specific entities or details
+
+######################
+-Examples-
+######################
+{examples}
+
+#############################
+-Real Data-
+######################
+Conversation History:
+{history}
+
+Current Query: {query}
+######################
+
+
+The `Output` should be human text, not unicode characters. Keep the same language as `Query`.
+Output:
+
+"""
+
 
 PROMPTS["keywords_extraction_examples"] = [
     """Example 1:

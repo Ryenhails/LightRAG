@@ -13,7 +13,7 @@ class NameSpace:
     VECTOR_STORE_CHUNKS = "chunks"
 
     GRAPH_STORE_CHUNK_ENTITY_RELATION = "chunk_entity_relation"
-
+    VECTOR_STORE_KEYWORDS = "keywords"
     DOC_STATUS = "doc_status"
 
 

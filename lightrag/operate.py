@@ -176,6 +176,19 @@ async def _handle_single_relationship_extraction(
         metadata={"created_at": time.time()},
     )
 
+async def _handle_content_keyword_extraction(
+    record_attributes: list[str],
+    chunk_key: str,
+):
+    if record_attributes[0] != '"content_keywords"':
+        return None
+    # add this record as a node in the G
+    keywords = record_attributes[1]
+    keywords_source_id = chunk_key
+    return dict(
+        keywords=keywords,
+        source_id=keywords_source_id,
+    )
 
 async def _merge_nodes_then_upsert(
     entity_name: str,
@@ -222,6 +235,19 @@ async def _merge_nodes_then_upsert(
         node_data=node_data,
     )
     node_data["entity_name"] = entity_name
+    return node_data
+
+async def _merge_keywords(
+    source_id: str,
+    nodes_data: list[dict],
+):
+
+    keywords = ("").join(set([dp["keywords"] for dp in nodes_data]))
+
+    node_data = dict(
+        source_id = source_id,
+        keywords=keywords,
+    )
     return node_data
 
 
@@ -337,6 +363,7 @@ async def extract_entities(
     knowledge_graph_inst: BaseGraphStorage,
     entity_vdb: BaseVectorStorage,
     relationships_vdb: BaseVectorStorage,
+    keywords_vdb: BaseVectorStorage,
     global_config: dict[str, str],
     llm_response_cache: BaseKVStorage | None = None,
 ) -> BaseGraphStorage | None:
@@ -388,7 +415,7 @@ async def extract_entities(
     already_processed = 0
     already_entities = 0
     already_relations = 0
-
+    already_keywords = 0
     async def _user_llm_func_with_cache(
         input_text: str, history_messages: list[dict[str, str]] = None
     ) -> str:
@@ -441,7 +468,7 @@ async def extract_entities(
             chunk_key_dp (tuple[str, TextChunkSchema]):
                 ("chunck-xxxxxx", {"tokens": int, "content": str, "full_doc_id": str, "chunk_order_index": int})
         """
-        nonlocal already_processed, already_entities, already_relations
+        nonlocal already_processed, already_entities, already_relations, already_keywords
         chunk_key = chunk_key_dp[0]
         chunk_dp = chunk_key_dp[1]
         content = chunk_dp["content"]
@@ -476,6 +503,8 @@ async def extract_entities(
 
         maybe_nodes = defaultdict(list)
         maybe_edges = defaultdict(list)
+        maybe_keywords = defaultdict(list)
+
         for record in records:
             record = re.search(r"\((.*)\)", record)
             if record is None:
@@ -490,7 +519,6 @@ async def extract_entities(
             if if_entities is not None:
                 maybe_nodes[if_entities["entity_name"]].append(if_entities)
                 continue
-
             if_relation = await _handle_single_relationship_extraction(
                 record_attributes, chunk_key
             )
@@ -498,16 +526,30 @@ async def extract_entities(
                 maybe_edges[(if_relation["src_id"], if_relation["tgt_id"])].append(
                     if_relation
                 )
+
+
+
+            if_keywords = await _handle_content_keyword_extraction(
+                record_attributes, chunk_key
+            )
+
+            if if_keywords is not None:
+                maybe_keywords[(if_keywords["source_id"])].append(
+                    if_keywords
+                )
+
         already_processed += 1
         already_entities += len(maybe_nodes)
         already_relations += len(maybe_edges)
+        already_keywords += len(maybe_keywords)
+
         now_ticks = PROMPTS["process_tickers"][
             already_processed % len(PROMPTS["process_tickers"])
         ]
         logger.debug(
             f"{now_ticks} Processed {already_processed} chunks, {already_entities} entities(duplicated), {already_relations} relations(duplicated)\r",
         )
-        return dict(maybe_nodes), dict(maybe_edges)
+        return dict(maybe_nodes), dict(maybe_edges), dict(maybe_keywords)
 
     results = []
     for result in tqdm_async(
@@ -522,11 +564,16 @@ async def extract_entities(
 
     maybe_nodes = defaultdict(list)
     maybe_edges = defaultdict(list)
-    for m_nodes, m_edges in results:
+    maybe_keywords = defaultdict(list)
+
+    for m_nodes, m_edges, m_keywords in results:
         for k, v in m_nodes.items():
             maybe_nodes[k].extend(v)
         for k, v in m_edges.items():
             maybe_edges[tuple(sorted(k))].extend(v)
+        for k, v in m_keywords.items():
+            maybe_keywords[k].extend(v)
+
     logger.debug("Inserting entities into storage...")
     all_entities_data = []
     for result in tqdm_async(
@@ -562,6 +609,22 @@ async def extract_entities(
         leave=False,
     ):
         all_relationships_data.append(await result)
+
+    all_keywords_data = []
+    for result in tqdm_async(
+        asyncio.as_completed(
+            [
+                _merge_keywords(k, v)
+                for k, v in maybe_keywords.items()
+            ]
+        ),
+        total=len(maybe_keywords),
+        desc="Level 3 - Inserting keywords",
+        unit="keywords",
+        position=4,
+        leave=False,
+    ):
+        all_keywords_data.append(await result)
 
     if not len(all_entities_data) and not len(all_relationships_data):
         logger.warning(
@@ -600,6 +663,17 @@ async def extract_entities(
             for dp in all_relationships_data
         }
         await relationships_vdb.upsert(data_for_vdb)
+
+    if keywords_vdb is not None:
+        data_for_vdb = {
+            compute_mdhash_id(dp["source_id"], prefix="key-"): {
+                "keywords": dp["keywords"],
+                "content": dp["keywords"],
+                "source_id": dp["source_id"],
+            }
+            for dp in all_keywords_data
+        }
+        await keywords_vdb.upsert(data_for_vdb)
 
     return knowledge_graph_inst
 
@@ -656,6 +730,9 @@ async def kg_query(
 
     # Build context
     keywords = [ll_keywords, hl_keywords]
+
+    print(keywords)
+
     context = await _build_query_context(
         keywords,
         knowledge_graph_inst,
@@ -728,6 +805,7 @@ async def kg_query_with_clues(
     entities_vdb: BaseVectorStorage,
     relationships_vdb: BaseVectorStorage,
     text_chunks_db: BaseKVStorage,
+    keywords_db: BaseKVStorage,
     query_param: QueryParam,
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
@@ -744,8 +822,8 @@ async def kg_query_with_clues(
         return cached_response
 
     # Extract keywords using extract_keywords_only function which already supports conversation history
-    hl_keywords, ll_keywords = await extract_keywords_only(
-        query, query_param, global_config, hashing_kv
+    hl_keywords, ll_keywords = await extract_keywords_with_keywords_vdb(
+        query, keywords_db, query_param, global_config, hashing_kv
     )
 
     logger.debug(f"High-level keywords: {hl_keywords}")
@@ -776,6 +854,8 @@ async def kg_query_with_clues(
     # Build context
     keywords = [ll_keywords, hl_keywords]
 
+    print(keywords)
+
     context = await _build_query_context(
         keywords,
         knowledge_graph_inst,
@@ -798,39 +878,39 @@ async def kg_query_with_clues(
             query_param.conversation_history, query_param.history_turns
         )
 
-    # Clues Extraction
-    max_retries = query_param.max_clue_extraction_retries
-    retries = 0
+    # # Clues Extraction
+    # max_retries = query_param.max_clue_extraction_retries
+    # retries = 0
+    #
+    # while retries < max_retries:
+    #     clues = await extract_clues_only(query, context, keywords, query_param, global_config, hashing_kv, clue_prompt)
+    #
+    #     if clues != []:  # 如果 clues 非空，直接退出循环
+    #         break
+    #
+    #     retries += 1
+    #     logger.warning(f"Retrying extract clues... (Attempt {retries}/{max_retries})")
+    #
+    # if clues == []:  # 如果重试后 clues 仍为空
+    #     return PROMPTS["fail_response"]
+    #
+    # clues = ", ".join(clues) if clues else ""
 
-    while retries < max_retries:
-        clues = await extract_clues_only(query, context, keywords, query_param, global_config, hashing_kv, clue_prompt)
-
-        if clues != []:  # 如果 clues 非空，直接退出循环
-            break
-
-        retries += 1
-        logger.warning(f"Retrying extract clues... (Attempt {retries}/{max_retries})")
-
-    if clues == []:  # 如果重试后 clues 仍为空
-        return PROMPTS["fail_response"]
-
-    clues = ", ".join(clues) if clues else ""
-
-    # Build context Again
-
-    keywords = [
-        combine_keywords_clues(ll_keywords, clues),
-        combine_keywords_clues(hl_keywords, clues)
-    ]
-
-    context = await _build_query_context(
-        keywords,
-        knowledge_graph_inst,
-        entities_vdb,
-        relationships_vdb,
-        text_chunks_db,
-        query_param,
-    )
+    # # Build context Again
+    #
+    # keywords = [
+    #     combine_keywords_clues(ll_keywords, clues),
+    #     combine_keywords_clues(hl_keywords, clues)
+    # ]
+    #
+    # context = await _build_query_context(
+    #     keywords,
+    #     knowledge_graph_inst,
+    #     entities_vdb,
+    #     relationships_vdb,
+    #     text_chunks_db,
+    #     query_param,
+    # )
 
     sys_prompt_temp = system_prompt if system_prompt else PROMPTS["rag_response"]
     sys_prompt = sys_prompt_temp.format(
@@ -929,6 +1009,114 @@ async def extract_keywords_only(
     # 4. Build the keyword-extraction prompt
     kw_prompt = PROMPTS["keywords_extraction"].format(
         query=text, examples=examples, language=language, history=history_context
+    )
+
+    len_of_prompts = len(encode_string_by_tiktoken(kw_prompt))
+    logger.debug(f"[kg_query]Prompt Tokens: {len_of_prompts}")
+
+    # 5. Call the LLM for keyword extraction
+    use_model_func = global_config["llm_model_func"]
+    result = await use_model_func(kw_prompt, keyword_extraction=True)
+
+    # 6. Parse out JSON from the LLM response
+    match = re.search(r"\{.*\}", result, re.DOTALL)
+    if not match:
+        logger.error("No JSON-like structure found in the LLM respond.")
+        return [], []
+    try:
+        keywords_data = json.loads(match.group(0))
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parsing error: {e}")
+        return [], []
+
+    hl_keywords = keywords_data.get("high_level_keywords", [])
+    ll_keywords = keywords_data.get("low_level_keywords", [])
+
+    # 7. Cache only the processed keywords with cache type
+    if hl_keywords or ll_keywords:
+        cache_data = {
+            "high_level_keywords": hl_keywords,
+            "low_level_keywords": ll_keywords,
+        }
+        await save_to_cache(
+            hashing_kv,
+            CacheData(
+                args_hash=args_hash,
+                content=json.dumps(cache_data),
+                prompt=text,
+                quantized=quantized,
+                min_val=min_val,
+                max_val=max_val,
+                mode=param.mode,
+                cache_type="keywords",
+            ),
+        )
+    return hl_keywords, ll_keywords
+
+async def extract_keywords_with_keywords_vdb(
+    text: str,
+    keywords_vdb: BaseKVStorage,
+    param: QueryParam,
+    global_config: dict[str, str],
+    hashing_kv: BaseKVStorage | None = None,
+) -> tuple[list[str], list[str]]:
+    """
+    Extract high-level and low-level keywords from the given 'text' using the LLM.
+    This method does NOT build the final RAG context or provide a final answer.
+    It ONLY extracts keywords (hl_keywords, ll_keywords).
+    """
+
+    # Handle cache if needed - add cache type for keywords
+    args_hash = compute_args_hash(param.mode, text, cache_type="keywords")
+    cached_response, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, text, param.mode, cache_type="keywords"
+    )
+    if cached_response is not None:
+        try:
+            keywords_data = json.loads(cached_response)
+            return keywords_data["high_level_keywords"], keywords_data[
+                "low_level_keywords"
+            ]
+        except (json.JSONDecodeError, KeyError):
+            logger.warning(
+                "Invalid cache format for keywords, proceeding with extraction"
+            )
+
+    # Query the top-k keywords list from chunks
+
+    results = await keywords_vdb.query(text, top_k=param.top_k)
+
+    if not len(results):
+        return PROMPTS["fail_response"]
+
+    content_keywords = [keyword.strip() for r in results for keyword in r["keywords"].strip('"').split(",")]
+
+    unique_keywords = list(set(content_keywords))
+
+    content_keywords_string = ", ".join(unique_keywords)
+
+    # Build the examples
+    example_number = global_config["addon_params"].get("example_number", None)
+    if example_number and example_number < len(PROMPTS["keywords_extraction_examples"]):
+        examples = "\n".join(
+            PROMPTS["keywords_extraction_examples"][: int(example_number)]
+        )
+    else:
+        examples = "\n".join(PROMPTS["keywords_extraction_examples"])
+    language = global_config["addon_params"].get(
+        "language", PROMPTS["DEFAULT_LANGUAGE"]
+    )
+
+    # 3. Process conversation history
+    history_context = ""
+    if param.conversation_history:
+        history_context = get_conversation_turns(
+            param.conversation_history, param.history_turns
+        )
+
+    # 4. Build the keyword-extraction prompt
+    kw_prompt = PROMPTS["keywords_extraction_clues"].format(
+        query=text, content_keywords = content_keywords_string, examples=examples, language=language, history=history_context
     )
 
     len_of_prompts = len(encode_string_by_tiktoken(kw_prompt))

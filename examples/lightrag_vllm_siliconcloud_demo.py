@@ -6,7 +6,7 @@ from lightrag.llm.siliconcloud import siliconcloud_embedding
 from lightrag.utils import EmbeddingFunc
 import numpy as np
 
-WORKING_DIR = "./clue_2_experiment_Qwen2.5-72B"
+WORKING_DIR = "./clue_3_experiment_Qwen2.5-72B"
 
 if not os.path.exists(WORKING_DIR):
     os.mkdir(WORKING_DIR)
@@ -56,36 +56,36 @@ rag = LightRAG(
     enable_llm_cache = True
 )
 
-
+#
 # with open("small-scale_experiment/cs_min_context.txt", encoding='utf-8') as f:
 #      rag.insert(f.read())
 
 # Perform local search
 
 print(
-    rag.query("I am a beginner, please give me a path to learn programming", param=QueryParam(mode="local"))
+    rag.query("What are the three main techniques used for semantic definitions in programming languages?", param=QueryParam(mode="local"))
  )
 #
 print(
-    rag.query("I am a beginner, please give me a path to learn programming", param=QueryParam(mode="local_with_clues"))
+    rag.query("What are the three main techniques used for semantic definitions in programming languages?", param=QueryParam(mode="local_with_clues"))
 )
 #
 #
 # # Perform global search
 #
 print(
-     rag.query("I am a beginner, please give me a path to learn programming", param=QueryParam(mode="global"))
+     rag.query("What are the three main techniques used for semantic definitions in programming languages?", param=QueryParam(mode="global"))
  )
 #
 print(
-    rag.query("I am a beginner, please give me a path to learn programming", param=QueryParam(mode="global_with_clues"))
+    rag.query("What are the three main techniques used for semantic definitions in programming languages?", param=QueryParam(mode="global_with_clues"))
 )
 #
 # # Perform hybrid search
 print(
-     rag.query("I am a beginner, please give me a path to learn programming", param=QueryParam(mode="hybrid"))
+     rag.query("What are the three main techniques used for semantic definitions in programming languages?", param=QueryParam(mode="hybrid"))
  )
 
 print(
-    rag.query("I am a beginner, please give me a path to learn programming", param=QueryParam(mode="hybrid_with_clues"))
+    rag.query("What are the three main techniques used for semantic definitions in programming languages?", param=QueryParam(mode="hybrid_with_clues"))
 )
