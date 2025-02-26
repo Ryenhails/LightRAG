@@ -345,3 +345,136 @@ When handling information with timestamps:
 - List up to 5 most important reference sources at the end under "References" sesction. Clearly indicating whether each source is from Knowledge Graph (KG) or Vector Data (DC), in the following format: [KG/DC] Source content
 - If you don't know the answer, just say so. Do not make anything up.
 - Do not include information not provided by the Data Sources."""
+
+
+PROMPTS["clue_extraction"] = """---Role---
+
+---Role---
+You're a precision-focused research assistant helping identify concrete search terms. Based on the provided information and existing keywords, generate specific clues that directly match retrievable items in our knowledge base.
+
+Read these carefully:
+
+---Context from Knowledge Base---
+{context_data}
+
+---Original Search Terms---
+{keywords}
+
+---Goal---
+Generate 3-5 clues that directly map to retrievable elements in the Knowledge Base for retrieval and answering.
+
+---Instructions---
+   - Clues are specific enough to find exact matches
+   - Use wording/phrases *directly* from the knowledge snippets
+   - Add new angles not covered by original keywords
+   - Match the query type:
+     * For analysis questions: comparison points, patterns
+     * For number/date questions: specific ranges or timeframes
+     * For overview requests: document sections or components
+   
+3. Format: Strict JSON with "clues" as key
+
+######################
+-Examples-
+######################
+{examples}
+
+#############################
+-Real Data-
+#############################
+Current Query: {query}
+#############################
+The `Output` should be human text, not unicode characters. Keep the same language as `Query`.
+Output:
+
+"""
+
+# No Usage
+PROMPTS["rag_with_clue_response"] = """---Role---
+
+You are a helpful assistant responding to user query about Knowledge Base provided below.
+
+---Goal---
+
+Generate a concise response based on Knowledge Base, clue questions and follow Response Rules, considering both the conversation history and the current query. Summarize all information in the provided Knowledge Base, and incorporating general knowledge relevant to the Knowledge Base. Do not include information not provided by Knowledge Base.
+
+When handling relationships with timestamps:
+1. Each relationship has a "created_at" timestamp indicating when we acquired this knowledge
+2. When encountering conflicting relationships, consider both the semantic content and the timestamp
+3. Don't automatically prefer the most recently created relationships - use judgment based on the context
+4. For time-specific queries, prioritize temporal information in the content before considering creation timestamps
+
+---Conversation History---
+{history}
+
+---Clue questions---
+{clues}
+
+---Knowledge Base---
+{context_data}
+
+---Response Rules---
+
+- Target format and length: {response_type}
+- Use markdown formatting with appropriate section headings
+- Please respond in the same language as the user's question.
+- Ensure the response maintains continuity with the conversation history.
+- If you don't know the answer, just say so.
+- Do not make anything up. Do not include information not provided by the Knowledge Base."""
+
+
+PROMPTS["clues_extraction_examples"] = [
+    """Example 1:
+
+    Query: "How to improve battery life in smartphones?"
+    ################
+    Output:
+    {
+      "clues": [
+        "screen brightness optimization",
+        "background app refresh",
+        "5G modem efficiency", 
+        "adaptive refresh rate",
+        "battery health algorithms",
+        "low-power processor modes",
+        "charging cycle patterns"
+      ]
+    }
+    #############################""",
+
+    """Example 2:
+
+Query: "Best practices for COVID-19 prevention"
+################
+Output:
+{
+  "clues": [
+    "mask filtration efficiency",
+    "ventilation standards",
+    "hand hygiene frequency",
+    "vaccine booster timing",
+    "surface disinfection methods",
+    "symptom monitoring criteria",
+    "high-risk exposure thresholds"
+  ]
+}
+#############################""",
+
+    """Example 3:
+
+Query: "Factors affecting bread fermentation"
+################
+Output:
+{
+  "clues": [
+    "yeast activation temperature",
+    "sugar concentration effects",
+    "dough hydration levels",
+    "proofing time ranges",
+    "altitude adjustments",
+    "enzyme activity inhibitors",
+    "gluten development impact"
+  ]
+}
+#############################""",
+]

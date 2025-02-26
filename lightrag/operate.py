@@ -722,6 +722,162 @@ async def kg_query(
     )
     return response
 
+async def kg_query_with_clues(
+    query: str,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+    global_config: dict[str, str],
+    hashing_kv: BaseKVStorage | None = None,
+    system_prompt: str | None = None,
+    clue_prompt: str | None = None
+) -> str:
+    # Handle cache
+    use_model_func = global_config["llm_model_func"]
+    args_hash = compute_args_hash(query_param.mode, query, cache_type="query")
+    cached_response, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, query, query_param.mode, cache_type="query"
+    )
+    if cached_response is not None:
+        return cached_response
+
+    # Extract keywords using extract_keywords_only function which already supports conversation history
+    hl_keywords, ll_keywords = await extract_keywords_only(
+        query, query_param, global_config, hashing_kv
+    )
+
+    logger.debug(f"High-level keywords: {hl_keywords}")
+    logger.debug(f"Low-level  keywords: {ll_keywords}")
+
+    # Handle empty keywords
+    if hl_keywords == [] and ll_keywords == []:
+        logger.warning("low_level_keywords and high_level_keywords is empty")
+        return PROMPTS["fail_response"]
+    if ll_keywords == [] and query_param.mode in ["local", "hybrid"]:
+        logger.warning(
+            "low_level_keywords is empty, switching from %s mode to global mode",
+            query_param.mode,
+        )
+        query_param.mode = "global"
+    if hl_keywords == [] and query_param.mode in ["global", "hybrid"]:
+        logger.warning(
+            "high_level_keywords is empty, switching from %s mode to local mode",
+            query_param.mode,
+        )
+        query_param.mode = "local"
+
+    ll_keywords = ", ".join(ll_keywords) if ll_keywords else ""
+    hl_keywords = ", ".join(hl_keywords) if hl_keywords else ""
+
+    logger.info("Using %s mode for query processing", query_param.mode)
+
+    # Build context
+    keywords = [ll_keywords, hl_keywords]
+
+    context = await _build_query_context(
+        keywords,
+        knowledge_graph_inst,
+        entities_vdb,
+        relationships_vdb,
+        text_chunks_db,
+        query_param,
+    )
+
+    if query_param.only_need_context:
+        return context
+    if context is None:
+        return PROMPTS["fail_response"]
+
+    # Process conversation history
+
+    history_context = ""
+    if query_param.conversation_history:
+        history_context = get_conversation_turns(
+            query_param.conversation_history, query_param.history_turns
+        )
+
+    # Clues Extraction
+    max_retries = query_param.max_clue_extraction_retries
+    retries = 0
+
+    while retries < max_retries:
+        clues = await extract_clues_only(query, context, keywords, query_param, global_config, hashing_kv, clue_prompt)
+
+        if clues != []:  # 如果 clues 非空，直接退出循环
+            break
+
+        retries += 1
+        logger.warning(f"Retrying extract clues... (Attempt {retries}/{max_retries})")
+
+    if clues == []:  # 如果重试后 clues 仍为空
+        return PROMPTS["fail_response"]
+
+    clues = ", ".join(clues) if clues else ""
+
+    # Build context Again
+
+    keywords = [
+        combine_keywords_clues(ll_keywords, clues),
+        combine_keywords_clues(hl_keywords, clues)
+    ]
+
+    context = await _build_query_context(
+        keywords,
+        knowledge_graph_inst,
+        entities_vdb,
+        relationships_vdb,
+        text_chunks_db,
+        query_param,
+    )
+
+    sys_prompt_temp = system_prompt if system_prompt else PROMPTS["rag_response"]
+    sys_prompt = sys_prompt_temp.format(
+        context_data=context,
+        response_type=query_param.response_type,
+        history=history_context,
+    )
+
+    if query_param.only_need_prompt:
+        return sys_prompt
+
+    len_of_prompts = len(encode_string_by_tiktoken(query + sys_prompt))
+    logger.debug(f"[kg_query]Prompt Tokens: {len_of_prompts}")
+
+    response = await use_model_func(
+        query,
+        system_prompt=sys_prompt,
+        stream=query_param.stream,
+    )
+
+    if isinstance(response, str) and len(response) > len(sys_prompt):
+        response = (
+            response.replace(sys_prompt, "")
+            .replace("user", "")
+            .replace("model", "")
+            .replace(query, "")
+            .replace("<system>", "")
+            .replace("</system>", "")
+            .strip()
+        )
+
+    # Save to cache
+    await save_to_cache(
+        hashing_kv,
+        CacheData(
+            args_hash=args_hash,
+            content=response,
+            prompt=query,
+            quantized=quantized,
+            min_val=min_val,
+            max_val=max_val,
+            mode=query_param.mode,
+            cache_type="query",
+        ),
+    )
+    return response
+
 
 async def extract_keywords_only(
     text: str,
@@ -817,6 +973,88 @@ async def extract_keywords_only(
         )
     return hl_keywords, ll_keywords
 
+async def extract_clues_only(
+    query: str,
+    context: str,
+    keywords: [str,str],
+    query_param: QueryParam,
+    global_config: dict[str, str],
+    hashing_kv: BaseKVStorage | None = None,
+    clue_prompt: str | None = None
+) -> list:
+    # Handle clues cache if needed - add cache type for clues
+    args_hash = compute_args_hash(query_param.mode, query, cache_type="clues")
+    cached_clues, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, query, query_param.mode, cache_type="clues"
+    )
+    if cached_clues is not None:
+        try:
+            clues = json.loads(cached_clues)
+            return clues["clues"]
+        except (json.JSONDecodeError, KeyError):
+            logger.warning(
+                "Invalid cache format for clues, proceeding with clues extraction"
+            )
+
+    # Extract clues
+    examples = "\n".join(PROMPTS["clues_extraction_examples"])
+    if query_param.mode == ["local_with_clues"]:
+        clue_prompt_temp = clue_prompt if clue_prompt else PROMPTS["clue_extraction"]
+        clue_prompt = clue_prompt_temp.format(
+            query=query, context_data=context, examples=examples,keywords=keywords[0]
+        )
+    elif query_param.mode == ["global_with_clues"]:
+        clue_prompt_temp = clue_prompt if clue_prompt else PROMPTS["clue_extraction"]
+        clue_prompt = clue_prompt_temp.format(
+            query=query, context_data=context, examples=examples,keywords=keywords[1]
+        )
+    else:
+        clue_prompt_temp = clue_prompt if clue_prompt else PROMPTS["clue_extraction"]
+        clue_prompt = clue_prompt_temp.format(
+            query=query, context_data=context, examples=examples, keywords=", ".join(keywords)
+        )
+
+    len_of_prompts = len(encode_string_by_tiktoken(clue_prompt))
+    logger.debug(f"[kg_query]Prompt Tokens: {len_of_prompts}")
+
+    use_model_func = global_config["llm_model_func"]
+    result = await use_model_func(
+        prompt=clue_prompt,
+        stream=query_param.stream,
+    )
+
+    # Parse out JSON from the LLM response
+    match = re.search(r"\{.*\}", result, re.DOTALL)
+    if not match:
+        logger.error("No JSON-like structure found in the LLM respond, clue is empty")
+        return []
+    try:
+        keywords_data = json.loads(match.group(0))
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parsing error: {e}")
+        return []
+
+    clues = keywords_data.get("clues", [])
+
+    # Cache clues
+    if clues:
+        cache_data = {
+            "clues": clues
+        }
+        await save_to_cache(
+            hashing_kv,
+            CacheData(
+                args_hash=args_hash,
+                content=json.dumps(cache_data),
+                prompt=query,
+                quantized=quantized,
+                min_val=min_val,
+                max_val=max_val,
+                mode=query_param.mode,
+                cache_type="clues",
+            ),
+        )
+    return clues
 
 async def mix_kg_vector_query(
     query: str,
@@ -1042,7 +1280,23 @@ async def _build_query_context(
             text_chunks_db,
             query_param,
         )
+    elif query_param.mode == "local_with_clues":
+        entities_context, relations_context, text_units_context = await _get_node_data(
+            ll_keywords,
+            knowledge_graph_inst,
+            entities_vdb,
+            text_chunks_db,
+            query_param,
+        )
     elif query_param.mode == "global":
+        entities_context, relations_context, text_units_context = await _get_edge_data(
+            hl_keywords,
+            knowledge_graph_inst,
+            relationships_vdb,
+            text_chunks_db,
+            query_param,
+        )
+    elif query_param.mode == "global_with_clues":
         entities_context, relations_context, text_units_context = await _get_edge_data(
             hl_keywords,
             knowledge_graph_inst,
@@ -1113,6 +1367,18 @@ async def _build_query_context(
 
     return result
 
+def extract_entity_relationship_from_context(text):
+    # 定义模式来匹配完整的Entities和Relationships部分
+    pattern = r"(-----Entities-----\s+```csv\s+.*?```\s+-----Relationships-----\s+```csv\s+.*?```)"
+
+    # 使用re.DOTALL使点(.)也能匹配换行符
+    match = re.search(pattern, text, re.DOTALL)
+
+    if match:
+        # 返回整个匹配的文本
+        return match.group(1)
+    else:
+        return None
 
 async def _get_node_data(
     query,
@@ -1846,3 +2112,8 @@ async def kg_query_with_keywords(
         ),
     )
     return response
+
+def combine_keywords_clues(base: str, addition: str) -> str:
+    if base and addition:
+        return f"{base}，{addition}"
+    return base or addition  # 处理有一方为空的情况

@@ -24,6 +24,7 @@ from .operate import (
     extract_entities,
     extract_keywords_only,
     kg_query,
+    kg_query_with_clues,
     kg_query_with_keywords,
     mix_kg_vector_query,
     naive_query,
@@ -1023,6 +1024,27 @@ class LightRAG:
         """
         if param.mode in ["local", "global", "hybrid"]:
             response = await kg_query(
+                query,
+                self.chunk_entity_relation_graph,
+                self.entities_vdb,
+                self.relationships_vdb,
+                self.text_chunks,
+                param,
+                asdict(self),
+                hashing_kv=self.llm_response_cache
+                if self.llm_response_cache
+                and hasattr(self.llm_response_cache, "global_config")
+                else self.key_string_value_json_storage_cls(
+                    namespace=make_namespace(
+                        self.namespace_prefix, NameSpace.KV_STORE_LLM_RESPONSE_CACHE
+                    ),
+                    global_config=asdict(self),
+                    embedding_func=self.embedding_func,
+                ),
+                system_prompt=system_prompt,
+            )
+        elif param.mode in ["local_with_clues", "global_with_clues", "hybrid_with_clues"]:
+            response = await kg_query_with_clues(
                 query,
                 self.chunk_entity_relation_graph,
                 self.entities_vdb,

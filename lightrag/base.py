@@ -81,6 +81,8 @@ class QueryParam:
     history_turns: int = 3
     """Number of complete conversation turns (user-assistant pairs) to consider in the response context."""
 
+    max_clue_extraction_retries: int = 3
+    """Number of max clue extraction retries."""
 
 @dataclass
 class StorageNameSpace(ABC):
